@@ -121,9 +121,47 @@ app.post('/login', async (req, res) => {
 });
 
 // ---- 연결 끊기 콜백 (콘솔에 이 URL 등록: /unlink) ----
-// 토스가 사용자 연결 해제 시 userKey 를 보내줘요. 여기서 해당 사용자 데이터를 정리하면 돼요.
-app.post('/unlink', async (req, res) => {
-  // (선택) basic auth 검증
+// 토스가 사용자 연결 해제 시 userKey 를 보내줘요.
+// 처리: 닉네임·반응 삭제 + 올린 조합/댓글은 익명화("탈퇴한 사용자") 후 소유 연결 해제.
+// 필요한 환경변수: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+async function supabaseReq(method, path, body) {
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !key) throw new Error('SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY 환경변수가 없어요.');
+  const res = await fetch(url.replace(/\/$/, '') + path, {
+    method,
+    headers: {
+      apikey: key,
+      Authorization: `Bearer ${key}`,
+      'Content-Type': 'application/json',
+      Prefer: 'return=minimal',
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok && res.status !== 404) {
+    throw new Error(`supabase ${method} ${path} -> ${res.status} ${await res.text()}`);
+  }
+}
+
+async function wipeUser(userKey) {
+  const dev = encodeURIComponent('toss_' + String(userKey));
+  // 1) 닉네임 삭제
+  await supabaseReq('DELETE', `/rest/v1/nicknames?user_key=eq.${dev}`);
+  // 2) 반응 삭제 (좋아요/따라했어요/북마크)
+  await supabaseReq('DELETE', `/rest/v1/reactions?device_id=eq.${dev}`);
+  // 3) 올린 조합 익명화 (콘텐츠는 유지, 개인 연결만 해제)
+  await supabaseReq('PATCH', `/rest/v1/combos?owner_device=eq.${dev}`,
+    { author: '탈퇴한 사용자', owner_device: null });
+  // 4) 댓글 익명화
+  await supabaseReq('PATCH', `/rest/v1/comments?owner_device=eq.${dev}`,
+    { author: '탈퇴한 사용자', owner_device: null });
+  // 5) 신고 기록의 신고자 연결 해제
+  await supabaseReq('PATCH', `/rest/v1/reports?reporter_device=eq.${dev}`,
+    { reporter_device: null });
+}
+
+async function handleUnlink(req, res) {
+  // (선택) basic auth 검증 — UNLINK_SECRET 설정 시 콘솔의 Basic Auth 헤더와 맞아야 해요
   const secret = process.env.UNLINK_SECRET;
   if (secret) {
     const got = (req.headers.authorization || '').replace(/^Basic\s+/i, '');
@@ -132,14 +170,18 @@ app.post('/unlink', async (req, res) => {
   const userKey = req.body?.userKey ?? req.query?.userKey;
   const referrer = req.body?.referrer ?? req.query?.referrer;
   console.log('[unlink]', { userKey, referrer });
-  // TODO: 필요하면 여기서 Supabase 의 해당 userKey 데이터 정리
-  return res.json({ ok: true });
-});
-app.get('/unlink', (req, res) => {
-  const userKey = req.query?.userKey;
-  console.log('[unlink:get]', { userKey, referrer: req.query?.referrer });
-  return res.json({ ok: true });
-});
+  if (userKey == null) return res.status(400).json({ ok: false, error: 'userKey 누락' });
+  try {
+    await wipeUser(userKey);
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('[unlink] 데이터 정리 실패:', e?.message ?? e);
+    // 실패해도 토스에는 ok — 로그 보고 수동 정리 (사용자 unlink 자체를 막지 않기 위해)
+    return res.json({ ok: true, note: 'cleanup_failed_logged' });
+  }
+}
+app.post('/unlink', handleUnlink);
+app.get('/unlink', handleUnlink);
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`pyeonggul-auth listening on ${PORT}`));
